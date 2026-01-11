@@ -1,168 +1,211 @@
-export default class PolyModeCore {
+export default class PolyModeOverlay {
   constructor(api) {
     this.api = api;
-    this.active = false; // Estado del modo selección
+    this.active = false;
     this.selection = new Set();
+    this.overlayDiv = null; // La capa transparente
   }
 
   init() {
-    // Esperamos 500ms para asegurar que SculptGL inició completamente
+    // Retraso de seguridad
     setTimeout(() => {
-      this._installUI();
-      this._overrideEngine(); // <--- Aquí ocurre la magia
-      console.log("PolyMode Core: Motor intervenido exitosamente.");
-    }, 500);
+      this._createUI();
+      console.log("PolyMode Overlay: Sistema de Capas listo.");
+    }, 1000);
   }
 
   // =================================================================
-  // 1. OVERRIDE DEL MOTOR (La clave para que funcione en iPad)
+  // 1. LA CAPA "ESCUDO" (OVERLAY)
   // =================================================================
-  _overrideEngine() {
-    const main = this.api.main;
-    
-    // Guardamos la función original de SculptGL para no romper nada
-    const originalOnDeviceDown = main.onDeviceDown.bind(main);
+  _toggleMode() {
+    this.active = !this.active;
+    const btn = document.getElementById('pm-main-btn');
 
-    // Reemplazamos el manejador de input de SculptGL con el nuestro
-    main.onDeviceDown = (event) => {
+    if (this.active) {
+      // ACTIVAR MODO SELECCIÓN
+      btn.innerText = '🟩 MODO SELECCIÓN (Activo)';
+      btn.style.background = '#00AA00';
+      btn.style.borderColor = '#00FF00';
       
-      // Si el modo Poly está ACTIVO, tomamos el control total
-      if (this.active) {
-        // 1. Le pedimos a SculptGL que calcule la posición del mouse/dedo
-        // Esto usa su variable interna _pixelRatio (vital para iPad)
-        main.setMousePosition(event);
-        
-        // 2. Usamos las coordenadas ya corregidas por el motor
-        const mx = main._mouseX;
-        const my = main._mouseY;
-        const mesh = main.getMesh();
+      // Creamos la capa que bloqueará a SculptGL
+      this._createOverlay();
+      
+    } else {
+      // VOLVER A MODO ESCULTURA
+      btn.innerText = '🖌️ MODO ESCULTURA';
+      btn.style.background = '#333';
+      btn.style.borderColor = '#555';
+      
+      // Destruimos la capa para devolver el control
+      this._removeOverlay();
+      
+      // Limpiamos visuales (opcional)
+      this._resetColors();
+    }
+  }
 
-        if (mesh) {
-          const picking = main.getPicking();
-          // 3. Ejecutamos el Raycast interno
-          if (picking.intersectionMouse(mesh, mx, my)) {
-            const faceIdx = picking._idId; // ID del triángulo tocado
-            this._toggleFace(mesh, faceIdx);
-            
-            // IMPORTANTE: Detenemos aquí. No llamamos a originalOnDeviceDown.
-            // Esto evita que rote la cámara o esculpa.
-            return; 
-          }
-        }
-      }
+  _createOverlay() {
+    if (this.overlayDiv) return;
 
-      // Si NO está activo, dejamos que SculptGL funcione normal
-      originalOnDeviceDown(event);
+    // Buscamos el canvas original para copiar su tamaño y posición
+    const canvas = this.api.getCanvas();
+    const rect = canvas.getBoundingClientRect();
+
+    // Creamos un DIV transparente que cubre exactamente el canvas
+    const div = document.createElement('div');
+    div.id = 'pm-overlay-layer';
+    div.style.position = 'absolute';
+    div.style.top = `${rect.top}px`;
+    div.style.left = `${rect.left}px`;
+    div.style.width = `${rect.width}px`;
+    div.style.height = `${rect.height}px`;
+    div.style.zIndex = '9999'; // Muy por encima de todo
+    div.style.cursor = 'crosshair';
+    div.style.touchAction = 'none'; // Evita scroll/zoom del navegador en iPad
+
+    // ESCUCHAMOS LOS TOQUES EN ESTA CAPA (No en el canvas)
+    div.addEventListener('pointerdown', (e) => this._onTouch(e));
+
+    document.body.appendChild(div);
+    this.overlayDiv = div;
+    
+    // Actualizamos posición si se redimensiona la ventana
+    window.onresize = () => {
+        const r = canvas.getBoundingClientRect();
+        div.style.top = `${r.top}px`;
+        div.style.left = `${r.left}px`;
+        div.style.width = `${r.width}px`;
+        div.style.height = `${r.height}px`;
     };
   }
 
+  _removeOverlay() {
+    if (this.overlayDiv) {
+      this.overlayDiv.remove();
+      this.overlayDiv = null;
+    }
+    window.onresize = null;
+  }
+
   // =================================================================
-  // 2. LÓGICA DE GEOMETRÍA (Pintar en GPU)
+  // 2. MATEMÁTICA Y SELECCIÓN
   // =================================================================
-  _toggleFace(mesh, faceIdx) {
-    // Gestión del Set de selección
+  _onTouch(e) {
+    // Evitamos cualquier gesto nativo del navegador
+    e.preventDefault();
+    e.stopPropagation();
+
+    const main = this.api.main;
+    const mesh = main.getMesh();
+    if (!mesh) return;
+
+    // --- CÁLCULO DE COORDENADAS IPAD ---
+    // Usamos las coordenadas relativas al DIV overlay, que son idénticas al canvas
+    const rect = this.overlayDiv.getBoundingClientRect();
+    const pr = window.devicePixelRatio || 1; // Factor Retina (2.0 o 3.0)
+
+    // Coordenada X/Y precisa dentro del buffer WebGL
+    const x = (e.clientX - rect.left) * pr;
+    const y = (e.clientY - rect.top) * pr;
+
+    // Usamos el picking de SculptGL "a control remoto"
+    const picking = main.getPicking();
+    
+    // intersectionMouse espera coordenadas escaladas por pixelRatio
+    if (picking.intersectionMouse(mesh, x, y)) {
+      const faceIdx = picking._idId;
+      this._handleSelection(mesh, faceIdx);
+    }
+  }
+
+  _handleSelection(mesh, faceIdx) {
+    // Lógica Toggle
     if (this.selection.has(faceIdx)) {
       this.selection.delete(faceIdx);
     } else {
       this.selection.add(faceIdx);
     }
-
-    this._updateVisuals(mesh);
+    
+    // Actualizar visuales
+    this._paintSelection(mesh);
   }
 
-  _updateVisuals(mesh) {
-    const colors = mesh.getColors(); // Float32Array directo del buffer
+  // =================================================================
+  // 3. VISUALIZACIÓN (VERDE)
+  // =================================================================
+  _paintSelection(mesh) {
+    const colors = mesh.getColors(); // Float32Array
     const faces = mesh.getFaces();
     
-    // 1. Limpieza rápida: Poner todo en Gris Claro (0.8)
-    // (Para optimizar en mallas grandes, solo deberíamos despintar lo previo, 
-    // pero para asegurar que se ve, pintamos todo)
-    colors.fill(0.8); 
+    // Reset a gris claro para que resalte
+    colors.fill(0.9);
 
-    // 2. Pintar selección de VERDE (0, 1, 0)
+    // Pintar seleccionados de VERDE
     this.selection.forEach(fIdx => {
-      // Un triángulo tiene 3 vértices
-      const v1 = faces[fIdx * 3];
-      const v2 = faces[fIdx * 3 + 1];
-      const v3 = faces[fIdx * 3 + 2];
-
-      // Pintamos los 3 vértices
-      const r = 0.0, g = 1.0, b = 0.0;
+      const i1 = faces[fIdx * 3];
+      const i2 = faces[fIdx * 3 + 1];
+      const i3 = faces[fIdx * 3 + 2];
       
-      colors[v1 * 3]     = r; colors[v1 * 3 + 1]     = g; colors[v1 * 3 + 2]     = b;
-      colors[v2 * 3]     = r; colors[v2 * 3 + 1]     = g; colors[v2 * 3 + 2]     = b;
-      colors[v3 * 3]     = r; colors[v3 * 3 + 1]     = g; colors[v3 * 3 + 2]     = b;
+      // Verde RGB (0, 1, 0)
+      colors[i1 * 3] = 0; colors[i1 * 3+1] = 1; colors[i1 * 3+2] = 0;
+      colors[i2 * 3] = 0; colors[i2 * 3+1] = 1; colors[i2 * 3+2] = 0;
+      colors[i3 * 3] = 0; colors[i3 * 3+1] = 1; colors[i3 * 3+2] = 0;
     });
 
-    // 3. ¡GOLPE A LA GPU! Forzamos la actualización
-    // Intentamos los dos métodos posibles según la versión de SculptGL
+    // Forzar actualización GPU
     if (mesh.updateColor) mesh.updateColor();
     else if (mesh.updateBuffers) mesh.updateBuffers();
     
-    // Renderizamos la escena
     this.api.render();
+  }
+  
+  _resetColors() {
+     const mesh = this.api.main.getMesh();
+     if(mesh) {
+         mesh.getColors().fill(1.0); // Blanco
+         if(mesh.updateColor) mesh.updateColor();
+         this.api.render();
+     }
   }
 
   // =================================================================
-  // 3. INTERFAZ DE USUARIO (Barra Superior)
+  // 4. INTERFAZ (BOTÓN GRANDE)
   // =================================================================
-  _installUI() {
-    // Estilos CSS
-    if (!document.getElementById('pm-css')) {
-      const style = document.createElement('style');
-      style.id = 'pm-css';
-      style.innerHTML = `
-        .pm-btn { 
-          background: #333; color: #ddd; border: 1px solid #555; 
-          padding: 6px 12px; margin-left: 10px; border-radius: 4px; 
-          font-weight: bold; cursor: pointer; display: inline-block;
-        }
-        .pm-btn.active { 
-          background: #00AA00; color: #fff; border-color: #00FF00; 
-          box-shadow: 0 0 8px rgba(0,255,0,0.4); 
-        }
-      `;
-      document.head.appendChild(style);
-    }
-
-    // Inyección en la barra superior
+  _createUI() {
     const topBar = document.querySelector('.gui-topbar');
-    if (topBar && !document.getElementById('pm-toggle')) {
-      const btn = document.createElement('button');
-      btn.id = 'pm-toggle';
-      btn.className = 'pm-btn';
-      btn.innerText = '🖌️ Sculpt Mode';
-      
-      btn.onclick = () => {
-        this.active = !this.active;
-        if (this.active) {
-          btn.innerText = '🟩 SELECT MODE';
-          btn.classList.add('active');
-          // Limpiamos selección previa al entrar
-          this.selection.clear();
-          this.api.main.setCanvasCursor('crosshair');
-        } else {
-          btn.innerText = '🖌️ Sculpt Mode';
-          btn.classList.remove('active');
-          // Restauramos color al salir
-          const mesh = this.api.main.getMesh();
-          if(mesh) {
-            mesh.getColors().fill(1.0); // Blanco
-            if(mesh.updateColor) mesh.updateColor();
-            this.api.render();
-          }
-          this.api.main.setCanvasCursor('default');
-        }
-      };
-      
-      // Insertar después del logo o al principio
-      topBar.appendChild(btn);
-    }
+    if (!topBar) return;
     
-    // Acción en menú Tools para limpiar
-    this.api.addGuiAction('PolyMode', 'Limpiar Selección', () => {
-      this.selection.clear();
-      if (this.api.main.getMesh()) this._updateVisuals(this.api.main.getMesh());
-    });
+    if (document.getElementById('pm-main-btn')) return;
+
+    // Contenedor
+    const container = document.createElement('div');
+    container.style = "display: inline-block; margin-left: 20px; border-left: 1px solid #666; padding-left: 15px; height: 100%; vertical-align: middle;";
+
+    // Botón Principal
+    const btn = document.createElement('button');
+    btn.id = 'pm-main-btn';
+    btn.innerText = '🖌️ MODO ESCULTURA';
+    btn.style = `
+      background: #333; color: white; border: 2px solid #555; 
+      padding: 8px 15px; border-radius: 6px; font-weight: bold; 
+      cursor: pointer; font-size: 13px; transition: all 0.2s;
+    `;
+    
+    btn.onclick = () => this._toggleMode();
+
+    // Botón Limpiar
+    const btnClear = document.createElement('button');
+    btnClear.innerText = '🗑️';
+    btnClear.title = 'Limpiar Selección';
+    btnClear.style = "background: #222; border: 1px solid #444; color: #ccc; padding: 8px; margin-left: 5px; border-radius: 6px; cursor: pointer;";
+    btnClear.onclick = () => {
+        this.selection.clear();
+        const mesh = this.api.main.getMesh();
+        if(mesh) this._paintSelection(mesh);
+    };
+
+    container.appendChild(btn);
+    container.appendChild(btnClear);
+    topBar.appendChild(container);
   }
 }
