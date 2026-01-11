@@ -1,394 +1,461 @@
-// AdvancedGizmoPlugin_v3.js
-// Plugin "Gizmo+" for SculptGL modular plugins (constructor(api) + init()).
-//
-// Fixes vs v2:
-// - Keeps gizmo visual/picking logic intact (no _updateMatrices patch) to avoid breaking viewport navigation.
-// - Patches Gizmo edit math so that Mode/Space chosen in the plugin matches how the mesh is actually transformed.
-//   * Mode: Move / Rotate / Scale / Universal (controls gizmo pickables)
-//   * Space: Global / Local / Surface Normal (affects transform axes/orientation)
-//   * Axis locks: X/Y/Z (controls which axes are available)
-//
-// Notes:
-// - Self-contained (no imports). It relies on existing SculptGL internals (Transform tool + Gizmo).
-// - "Surface Normal" uses the picked normal under the cursor when the drag starts.
-//   If no normal is available, it falls back to Global.
+// AdvancedGizmoPlugin_v4.js
+// - Compatible con PluginManager nuevo: export default class { constructor(api){} init(){} }
+// - AÃ±ade: modos (Mover/Rotar/Escalar/Universal), espacio (Global/Local/Normal superficie), bloqueo de ejes (X/Y/Z)
+// - Corrige: orientaciÃ³n local REAL (afecta a la malla) y evita bloquear la cÃ¡mara (no habilita planos por defecto)
 
+import { vec2, vec3, mat3, mat4 } from 'gl-matrix';
+import Gizmo from 'editing/Gizmo';
+
+/**
+ * Notas tÃ©cnicas (repo):
+ * - Gizmo aplica Local para rot/scale via _scaleRotateEditMatrix (usa _editLocal/_editLocalInv).
+ * - Translate/Plane NO pasan por _scaleRotateEditMatrix, pero sÃ­ usan _editScaleRotInv en _updateMatrixTranslate.
+ * - Para que "Local" funcione en translate/plane, hay que cambiar la DIRECCIÃ“N del eje/plano en el espacio world
+ *   (en coords de _editTransInv) de manera consistente con la orientaciÃ³n del gizmo.
+ * - Para que el gizmo se vea local/normal, multiplicamos traScale por una rotaciÃ³n R antes de updateFinalMatrix.
+ */
+
+// ---- Helpers ----
+function _normalize3(out, a) {
+  const len = Math.hypot(a[0], a[1], a[2]) || 1.0;
+  out[0] = a[0] / len; out[1] = a[1] / len; out[2] = a[2] / len;
+  return out;
+}
+
+function _extractBasisFromMat4(m4) {
+  // gl-matrix es column-major: columnas 0,1,2 son los ejes (con escala).
+  const x = vec3.fromValues(m4[0], m4[1], m4[2]);
+  const y = vec3.fromValues(m4[4], m4[5], m4[6]);
+  const z = vec3.fromValues(m4[8], m4[9], m4[10]);
+  _normalize3(x, x);
+  _normalize3(y, y);
+  _normalize3(z, z);
+
+  // Re-ortogonalizar suave (Gram-Schmidt) por si hay skew numÃ©rico
+  // y = normalize(y - dot(y,x)*x)
+  const dotyx = x[0]*y[0]+x[1]*y[1]+x[2]*y[2];
+  y[0] -= dotyx*x[0]; y[1] -= dotyx*x[1]; y[2] -= dotyx*x[2];
+  _normalize3(y, y);
+
+  // z = normalize(cross(x,y)) para garantizar mano derecha
+  const zx = x[1]*y[2]-x[2]*y[1];
+  const zy = x[2]*y[0]-x[0]*y[2];
+  const zz = x[0]*y[1]-x[1]*y[0];
+  const z2 = vec3.fromValues(zx, zy, zz);
+  _normalize3(z2, z2);
+
+  return { x, y, z: z2 };
+}
+
+function _basisToMat4(basis) {
+  // Construye matriz rotaciÃ³n (column-major) a partir de ejes world
+  const m = mat4.create();
+  m[0]=basis.x[0]; m[1]=basis.x[1]; m[2]=basis.x[2];
+  m[4]=basis.y[0]; m[5]=basis.y[1]; m[6]=basis.y[2];
+  m[8]=basis.z[0]; m[9]=basis.z[1]; m[10]=basis.z[2];
+  return m;
+}
+
+function _computeSurfaceNormalBasis(main) {
+  const mesh = main.getMesh && main.getMesh();
+  const picking = main.getPicking && main.getPicking();
+  if (!mesh || !picking) return null;
+
+  // Intersect ray con la malla (NO con pickables del gizmo) usando el picking principal
+  // Esto es importante porque al arrastrar el gizmo el "picking actual" puede ser el del gizmo.
+  // intersectionMouseMesh(mesh) usa la posiciÃ³n actual del mouse ya seteada en main.
+  const hit = picking.intersectionMouseMesh(mesh);
+  if (!hit) return null;
+  picking.computePickedNormal();
+  const nLocal = picking.getPickedNormal();
+  if (!nLocal) return null;
+
+  // Normal local -> world (usar mat3 del scaleRot y normalizar)
+  const m4 = mesh.getMatrix();
+  const m3 = mat3.create();
+  mat3.fromMat4(m3, m4);
+  const nWorld = vec3.create();
+  vec3.transformMat3(nWorld, nLocal, m3);
+  _normalize3(nWorld, nWorld);
+
+  // Elegir un vector auxiliar para construir tangente (evitar paralelismo)
+  const up = Math.abs(nWorld[1]) < 0.95 ? vec3.fromValues(0,1,0) : vec3.fromValues(1,0,0);
+  const x = vec3.create();
+  vec3.cross(x, up, nWorld);
+  if (Math.hypot(x[0],x[1],x[2]) < 1e-6) return null;
+  _normalize3(x, x);
+  const y = vec3.create();
+  vec3.cross(y, nWorld, x);
+  _normalize3(y, y);
+
+  return { x, y, z: nWorld };
+}
+
+function _axisMaskToActivatedType(mode, mask) {
+  // mode: 'move' | 'rotate' | 'scale' | 'universal'
+  const X = mask.x ? 1 : 0;
+  const Y = mask.y ? 1 : 0;
+  const Z = mask.z ? 1 : 0;
+
+  // Bits del Gizmo (no exporta "PLANE_*" pÃºblicamente, pero sÃ­ TRANS/ROT/SCALE constantes).
+  // Usamos getters estÃ¡ticos que existen en Gizmo.js.
+  const T = (X ? Gizmo.TRANS_X : 0) | (Y ? Gizmo.TRANS_Y : 0) | (Z ? Gizmo.TRANS_Z : 0);
+  const R = (X ? Gizmo.ROT_X : 0) | (Y ? Gizmo.ROT_Y : 0) | (Z ? Gizmo.ROT_Z : 0);
+  const S = (X ? Gizmo.SCALE_X : 0) | (Y ? Gizmo.SCALE_Y : 0) | (Z ? Gizmo.SCALE_Z : 0);
+
+  // IMPORTANTE: no incluimos planos por defecto (PLANE_*) porque capturan clicks y rompen la cÃ¡mara.
+  // Si quieres planos luego, lo agregamos como opciÃ³n extra.
+  if (mode === 'move') return T;
+  if (mode === 'rotate') return R | Gizmo.ROT_W; // ROT_W (arco libre) Ãºtil, no rompe cÃ¡mara
+  if (mode === 'scale') return S | Gizmo.SCALE_W;
+  // universal
+  return (T | R | S | Gizmo.ROT_W | Gizmo.SCALE_W);
+}
+
+// ---- Monkey-patch (una sola vez) ----
+const PATCH_KEY = '__advancedGizmoPatchV4__';
+
+function patchGizmoPrototype() {
+  const proto = Gizmo.prototype;
+  if (proto[PATCH_KEY]) return;
+  proto[PATCH_KEY] = true;
+
+  // Guardamos originales
+  const _origUpdateMatrices = proto._updateMatrices;
+  const _origStartTranslateEdit = proto._startTranslateEdit;
+  const _origUpdateTranslateEdit = proto._updateTranslateEdit;
+  const _origUpdatePlaneEdit = proto._updatePlaneEdit;
+
+  // Utilidad en la instancia: obtener orientaciÃ³n deseada (mat4 rotaciÃ³n)
+  proto._ag_getOrientMat = function () {
+    const main = this._main;
+    const mode = this._ag_orientMode || 'global';
+    if (mode === 'global') return null;
+
+    const mesh = main.getMesh && main.getMesh();
+    if (!mesh) return null;
+
+    if (mode === 'local') {
+      const basis = _extractBasisFromMat4(mesh.getMatrix());
+      return _basisToMat4(basis);
+    }
+
+    if (mode === 'normal') {
+      const basis = _computeSurfaceNormalBasis(main);
+      if (!basis) return null;
+      return _basisToMat4(basis);
+    }
+
+    return null;
+  };
+
+  // Devuelve direcciÃ³n world del eje X/Y/Z segÃºn orientaciÃ³n activa
+  proto._ag_getAxisWorld = function (axisIndex) {
+    const R = this._ag_cachedOrientMat; // mat4 rot
+    if (!R) {
+      // global
+      if (axisIndex === 0) return vec3.fromValues(1,0,0);
+      if (axisIndex === 1) return vec3.fromValues(0,1,0);
+      return vec3.fromValues(0,0,1);
+    }
+    // columnas del mat4
+    if (axisIndex === 0) return vec3.fromValues(R[0], R[1], R[2]);
+    if (axisIndex === 1) return vec3.fromValues(R[4], R[5], R[6]);
+    return vec3.fromValues(R[8], R[9], R[10]);
+  };
+
+  // 1) VISUAL: rotar gizmo completo (traScale * R) si Local/Normal
+  proto._updateMatrices = function () {
+    // Calcula matrices y escala como siempre
+    _origUpdateMatrices.call(this);
+
+    // Pero si hay modo local/normal, re-calculamos el "mat base" y lo aplicamos
+    // sin tocar la lÃ³gica de tamaÃ±o/screen-constant.
+    // Para no duplicar todo el mÃ©todo, reconstruimos el mat que usa updateFinalMatrix:
+    // usamos el centro ya computado (en _computeCenterGizmo) dentro de _origUpdateMatrices
+    // NO disponible directamente => por eso hacemos una segunda pasada compacta.
+
+    const R = this._ag_getOrientMat();
+    this._ag_cachedOrientMat = R;
+
+    if (!R) return; // global, ya estÃ¡
+
+    const camera = this._main.getCamera();
+    const trMesh = this._computeCenterGizmo(); // center world
+    const eye = camera.computePosition();
+
+    this._lastDistToEye = this._isEditing ? this._lastDistToEye : vec3.dist(eye, trMesh);
+    const scaleFactor = (this._lastDistToEye * 80.0) / camera.getConstantScreen();
+
+    const traScale = mat4.create();
+    mat4.translate(traScale, traScale, trMesh);
+    mat4.scale(traScale, traScale, [scaleFactor, scaleFactor, scaleFactor]);
+
+    // mat = traScale * R
+    const mat = mat4.create();
+    mat4.mul(mat, traScale, R);
+
+    // volver a setear matrices finales con orientaciÃ³n (sin cambiar arc rotation; ya se hizo)
+    this._transX.updateFinalMatrix(mat);
+    this._transY.updateFinalMatrix(mat);
+    this._transZ.updateFinalMatrix(mat);
+
+    this._planeX.updateFinalMatrix(mat);
+    this._planeY.updateFinalMatrix(mat);
+    this._planeZ.updateFinalMatrix(mat);
+
+    this._rotX.updateFinalMatrix(mat);
+    this._rotY.updateFinalMatrix(mat);
+    this._rotZ.updateFinalMatrix(mat);
+    this._rotW.updateFinalMatrix(traScale); // arco libre debe seguir en view-space (como el original)
+
+    this._scaleX.updateFinalMatrix(mat);
+    this._scaleY.updateFinalMatrix(mat);
+    this._scaleZ.updateFinalMatrix(mat);
+    this._scaleW.updateFinalMatrix(mat);
+  };
+
+  // 2) TRASLACIÃ“N: hacer que el eje/plano de intersecciÃ³n siga la orientaciÃ³n del gizmo
+  proto._startTranslateEdit = function () {
+    // Guardar matrices de ediciÃ³n igual que siempre (usa editScaleRotInv)
+    this._saveEditMatrices();
+
+    const main = this._main;
+    const camera = main.getCamera();
+    const origin = this._editLineOrigin;
+    const dir = this._editLineDirection;
+
+    // center
+    this._computeCenterGizmo(origin);
+
+    // direcciÃ³n world del eje seleccionado segÃºn orientaciÃ³n
+    const nbAxis = this._selected._nbAxis;
+    const axisWorld = (nbAxis === -1) ? vec3.fromValues(0,0,0) : this._ag_getAxisWorld(nbAxis);
+
+    const p2 = vec3.create();
+    vec3.add(p2, origin, axisWorld);
+
+    // project
+    vec3.copy(origin, camera.project(origin));
+    vec3.copy(dir, camera.project(p2));
+
+    vec2.normalize(dir, vec2.sub(dir, dir, origin));
+
+    // offset (como original)
+    const lastInter = this._selected._lastInter;
+    vec3.transformMat4(lastInter, lastInter, this._selected._finalMatrix);
+    vec3.copy(lastInter, camera.project(lastInter));
+
+    vec2.sub(this._editOffset, lastInter, origin);
+    vec2.set(this._editLineOrigin, main._mouseX, main._mouseY);
+  };
+
+  // 3) Update translate (lÃ­nea-lÃ­nea) con direcciÃ³n del eje orientada
+  proto._updateTranslateEdit = function () {
+    const main = this._main;
+    const camera = main.getCamera();
+
+    const origin2d = this._editLineOrigin;
+    const dir2d = this._editLineDirection;
+
+    let vec2d = [main._mouseX, main._mouseY, 0.0];
+    vec2.sub(vec2d, vec2d, origin2d);
+    vec2.sub(vec2d, vec2d, this._editOffset);
+    vec2.scaleAndAdd(vec2d, origin2d, dir2d, vec2.dot(vec2d, dir2d));
+
+    // helper line
+    this._updateLineHelper(origin2d[0], origin2d[1], vec2d[0], vec2d[1]);
+
+    // unproject ray
+    const near = camera.unproject(vec2d[0], vec2d[1], 0.0);
+    const far = camera.unproject(vec2d[0], vec2d[1], 0.1);
+
+    vec3.transformMat4(near, near, this._editTransInv);
+    vec3.transformMat4(far, far, this._editTransInv);
+
+    // ray dir
+    const rayDir = vec3.create();
+    vec3.normalize(rayDir, vec3.sub(rayDir, far, near));
+
+    // axis direction in editTransInv space (world centered)
+    const nbAxis = this._selected._nbAxis;
+    const axisWorld = (nbAxis === -1) ? vec3.fromValues(0,0,0) : this._ag_getAxisWorld(nbAxis);
+    const axis = vec3.clone(axisWorld);
+    _normalize3(axis, axis);
+
+    // line-line closest points between:
+    // L0: near + t*rayDir
+    // L1: 0 + s*axis    (axis line through origin in centered space)
+    const a01 = -vec3.dot(rayDir, axis);
+    const b0 = vec3.dot(near, rayDir);
+    const b1 = -vec3.dot(near, axis);
+    const det = 1.0 - a01 * a01;
+    if (Math.abs(det) < 1e-8) return false;
+    const s = (a01 * b0 - b1) / det;
+
+    const inter = vec3.create();
+    vec3.scale(inter, axis, s);
+
+    this._updateMatrixTranslate(inter);
+    main.render();
+  };
+
+  // 4) Plane edit (mover en 2 ejes, bloqueando uno) con normal orientada
+  proto._updatePlaneEdit = function () {
+    const main = this._main;
+    const camera = main.getCamera();
+
+    const vec2d = [main._mouseX, main._mouseY, 0.0];
+    vec2.sub(vec2d, vec2d, this._editOffset);
+
+    this._updateLineHelper(
+      this._editLineOrigin[0],
+      this._editLineOrigin[1],
+      main._mouseX,
+      main._mouseY
+    );
+
+    const near = camera.unproject(vec2d[0], vec2d[1], 0.0);
+    const far = camera.unproject(vec2d[0], vec2d[1], 0.1);
+
+    vec3.transformMat4(near, near, this._editTransInv);
+    vec3.transformMat4(far, far, this._editTransInv);
+
+    const nbAxis = this._selected._nbAxis;
+    const nWorld = (nbAxis === -1) ? vec3.fromValues(0,0,0) : this._ag_getAxisWorld(nbAxis);
+    const planeN = vec3.clone(nWorld);
+    _normalize3(planeN, planeN);
+
+    const dist1 = vec3.dot(near, planeN);
+    const dist2 = vec3.dot(far, planeN);
+    if (dist1 === dist2) return false;
+
+    const val = -dist1 / (dist2 - dist1);
+    const inter = vec3.create();
+    inter[0] = near[0] + (far[0] - near[0]) * val;
+    inter[1] = near[1] + (far[1] - near[1]) * val;
+    inter[2] = near[2] + (far[2] - near[2]) * val;
+
+    this._updateMatrixTranslate(inter);
+    main.render();
+  };
+}
+
+// ---- Plugin ----
 export default class AdvancedGizmoPlugin {
   constructor(api) {
     this.api = api;
-
-    this.mode = 'Universal'; // Universal | Move | Rotate | Scale
-    this.space = 'Global';   // Global | Local | Normal
-    this.axis = { x: true, y: true, z: true };
-
-    this._patchedGizmos = new WeakSet();
-    this._patchedGizmoProto = false;
+    this._mode = 'universal'; // move|rotate|scale|universal
+    this._space = 'global'; // global|local|normal
+    this._axisMask = { x: true, y: true, z: true };
   }
 
   init() {
-    // Basic UI (PluginManager currently exposes only addGuiAction)
-    if (this.api && this.api.addGuiAction) this._buildButtonUI();
+    patchGizmoPrototype();
 
-    // Patch prototype once so behavior matches plugin selections
-    this._patchGizmoPrototypeOnce();
+    const api = this.api;
+    const main = api.main;
 
-    // Apply once at init (in case Transform tool already active)
-    this._applyToCurrentTool(true);
-  }
-
-  // ---------------- UI ----------------
-
-  _buildButtonUI() {
-    const add = this.api.addGuiAction.bind(this.api);
-
-    const rerender = () => { try { this.api.render && this.api.render(); } catch (e) {} };
-
-    // Modes
-    add('Gizmo+', 'Modo: Universal', () => { this.mode = 'Universal'; this._applyToCurrentTool(true); rerender(); });
-    add('Gizmo+', 'Modo: Mover',     () => { this.mode = 'Move';      this._applyToCurrentTool(true); rerender(); });
-    add('Gizmo+', 'Modo: Rotar',     () => { this.mode = 'Rotate';    this._applyToCurrentTool(true); rerender(); });
-    add('Gizmo+', 'Modo: Escalar',   () => { this.mode = 'Scale';     this._applyToCurrentTool(true); rerender(); });
-
-    // Space
-    add('Gizmo+', 'Espacio: Global',            () => { this.space = 'Global'; this._applyToCurrentTool(false); rerender(); });
-    add('Gizmo+', 'Espacio: Local',             () => { this.space = 'Local';  this._applyToCurrentTool(false); rerender(); });
-    add('Gizmo+', 'Espacio: Normal Superficie', () => { this.space = 'Normal'; this._applyToCurrentTool(false); rerender(); });
-
-    // Axis locks
-    add('Gizmo+', `Ejes: X ${this.axis.x ? 'âœ…' : 'âŒ'}`, () => { this.axis.x = !this.axis.x; this._applyToCurrentTool(true); rerender(); });
-    add('Gizmo+', `Ejes: Y ${this.axis.y ? 'âœ…' : 'âŒ'}`, () => { this.axis.y = !this.axis.y; this._applyToCurrentTool(true); rerender(); });
-    add('Gizmo+', `Ejes: Z ${this.axis.z ? 'âœ…' : 'âŒ'}`, () => { this.axis.z = !this.axis.z; this._applyToCurrentTool(true); rerender(); });
-
-    // Helper to refresh labels without richer UI:
-    add('Gizmo+', 'Refrescar UI Gizmo+', () => { /* no-op button for now */ });
-  }
-
-  // ---------------- Core ----------------
-
-  _applyToCurrentTool(forcePickables) {
-    const main = (this.api.getScene && this.api.getScene()) || this.api.main;
-    if (!main || !main.getSculptManager) return;
-
-    const sculpt = main.getSculptManager();
-    if (!sculpt || !sculpt.getCurrentTool) return;
-
-    const tool = sculpt.getCurrentTool();
-    if (!tool || !tool._gizmo) return;
-
-    const gizmo = tool._gizmo;
-    if (!gizmo || typeof gizmo.setActivatedType !== 'function') return;
-
-    // Patch instance once to attach state + keep in sync
-    this._patchGizmoInstanceOnce(gizmo);
-
-    // Update state stored on gizmo (used by prototype patches)
-    gizmo.__gizmoPlusMode = this.mode;
-    gizmo.__gizmoPlusSpace = this.space;
-    gizmo.__gizmoPlusAxis = { x: !!this.axis.x, y: !!this.axis.y, z: !!this.axis.z };
-
-    // Update pickables based on mode/axis
-    if (forcePickables) {
-      const type = this._computeActivatedType(gizmo);
-      gizmo.setActivatedType(type);
-    }
-  }
-
-  _patchGizmoInstanceOnce(gizmo) {
-    if (this._patchedGizmos.has(gizmo)) return;
-    this._patchedGizmos.add(gizmo);
-
-    // default state
-    gizmo.__gizmoPlusMode = this.mode;
-    gizmo.__gizmoPlusSpace = this.space;
-    gizmo.__gizmoPlusAxis = { x: !!this.axis.x, y: !!this.axis.y, z: !!this.axis.z };
-
-    // cache basis for Local space (computed at drag start)
-    gizmo.__gizmoPlusBasis = null; // { x:[..], y:[..], z:[..] } in world space
-    gizmo.__gizmoPlusNormal = null; // [..] in world space
-  }
-
-  _computeActivatedType(gizmo) {
-    const G = gizmo.constructor;
-
-    const onX = !!this.axis.x;
-    const onY = !!this.axis.y;
-    const onZ = !!this.axis.z;
-
-    const TRANS = (onX ? G.TRANS_X : 0) | (onY ? G.TRANS_Y : 0) | (onZ ? G.TRANS_Z : 0);
-    const ROT   = (onX ? G.ROT_X : 0)   | (onY ? G.ROT_Y : 0)   | (onZ ? G.ROT_Z : 0);
-    const SCALE = (onX ? G.SCALE_X : 0) | (onY ? G.SCALE_Y : 0) | (onZ ? G.SCALE_Z : 0);
-
-    // Planes depend on the two remaining axes
-    const PLANE =
-      ((onY && onZ) ? G.PLANE_X : 0) |
-      ((onX && onZ) ? G.PLANE_Y : 0) |
-      ((onX && onY) ? G.PLANE_Z : 0);
-
-    if (this.mode === 'Move') return TRANS | PLANE;
-    if (this.mode === 'Rotate') return ROT | ((onX || onY || onZ) ? G.ROT_W : 0);
-    if (this.mode === 'Scale') return SCALE | ((onX || onY || onZ) ? G.SCALE_W : 0);
-
-    // Universal
-    const hasAny = (onX || onY || onZ);
-    return TRANS | PLANE | ROT | SCALE | (hasAny ? (G.ROT_W | G.SCALE_W) : 0);
-  }
-
-  // ---------------- Gizmo behavior patching ----------------
-
-  _patchGizmoPrototypeOnce() {
-    if (this._patchedGizmoProto) return;
-
-    // Try to locate Gizmo prototype through an existing instance (current tool)
-    const main = (this.api.getScene && this.api.getScene()) || this.api.main;
-    if (!main || !main.getSculptManager) return;
-    const sculpt = main.getSculptManager();
-    if (!sculpt || !sculpt.getCurrentTool) return;
-
-    const tool = sculpt.getCurrentTool();
-    if (!tool || !tool._gizmo) return;
-
-    const gizmo = tool._gizmo;
-    if (!gizmo) return;
-
-    const proto = Object.getPrototypeOf(gizmo);
-    if (!proto) return;
-
-    // --- Minimal math helpers (column-major 4x4) ---
-    const v3 = {
-      dot: (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2],
-      cross: (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]],
-      len: (a) => Math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]) || 1.0,
-      norm: (a) => { const l = Math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]) || 1.0; return [a[0]/l, a[1]/l, a[2]/l]; },
-      scale: (a, s) => [a[0]*s, a[1]*s, a[2]*s],
-      add: (a,b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]],
-      sub: (a,b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]]
-    };
-
-    const m4 = {
-      identity: () => [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
-      mul: (a, b) => { // out = a*b
-        const out = new Array(16);
-        for (let c=0;c<4;c++) {
-          const b0=b[c*4+0], b1=b[c*4+1], b2=b[c*4+2], b3=b[c*4+3];
-          out[c*4+0] = a[0]*b0 + a[4]*b1 + a[8]*b2 + a[12]*b3;
-          out[c*4+1] = a[1]*b0 + a[5]*b1 + a[9]*b2 + a[13]*b3;
-          out[c*4+2] = a[2]*b0 + a[6]*b1 + a[10]*b2 + a[14]*b3;
-          out[c*4+3] = a[3]*b0 + a[7]*b1 + a[11]*b2 + a[15]*b3;
-        }
-        return out;
-      },
-      rotAxis: (axis, angle) => {
-        const a = v3.norm(axis);
-        const x=a[0], y=a[1], z=a[2];
-        const c=Math.cos(angle), s=Math.sin(angle), t=1-c;
-        // column-major
-        return [
-          t*x*x + c,     t*x*y + s*z, t*x*z - s*y, 0,
-          t*x*y - s*z,   t*y*y + c,   t*y*z + s*x, 0,
-          t*x*z + s*y,   t*y*z - s*x, t*z*z + c,   0,
-          0,             0,           0,           1
-        ];
-      },
-      // Multiply 4x4 by vec3 as direction (w=0) or point (w=1)
-      transformDir: (m, v) => {
-        const x=v[0], y=v[1], z=v[2];
-        return [
-          m[0]*x + m[4]*y + m[8]*z,
-          m[1]*x + m[5]*y + m[9]*z,
-          m[2]*x + m[6]*y + m[10]*z
-        ];
-      }
-    };
-
-    const _getWorldBasisFromMesh = (mesh) => {
-      // mesh.getMatrix() is column-major. Extract rotation+scale columns.
-      // We'll normalize to get pure axes in world space.
-      const m = mesh.getMatrix();
-      const x = v3.norm([m[0], m[1], m[2]]);
-      const y = v3.norm([m[4], m[5], m[6]]);
-      const z = v3.norm([m[8], m[9], m[10]]);
-      return { x, y, z };
-    };
-
-    const _getAxisWorld = (gizmo, nbAxis) => {
-      const sp = gizmo.__gizmoPlusSpace || 'Global';
-
-      // Normal space: prefer picked normal (for "Z"), build orthonormal basis
-      if (sp === 'Normal' && gizmo.__gizmoPlusNormal) {
-        const n = v3.norm(gizmo.__gizmoPlusNormal);
-        // choose an arbitrary tangent
-        const up = Math.abs(n[1]) < 0.9 ? [0,1,0] : [1,0,0];
-        const t = v3.norm(v3.cross(up, n));
-        const b = v3.norm(v3.cross(n, t));
-        if (nbAxis === 0) return t;     // X -> tangent
-        if (nbAxis === 1) return b;     // Y -> bitangent
-        return n;                        // Z -> normal
-      }
-
-      if (sp === 'Local' && gizmo.__gizmoPlusBasis) {
-        if (nbAxis === 0) return gizmo.__gizmoPlusBasis.x;
-        if (nbAxis === 1) return gizmo.__gizmoPlusBasis.y;
-        return gizmo.__gizmoPlusBasis.z;
-      }
-
-      // Global
-      if (nbAxis === 0) return [1,0,0];
-      if (nbAxis === 1) return [0,1,0];
-      return [0,0,1];
-    };
-
-    // Patch onMouseDown to capture basis/normal at drag start
-    const origOnMouseDown = proto.onMouseDown;
-    proto.onMouseDown = function() {
+    // Asegurar que el gizmo actual (tool Transform) tome settings
+    const applyToCurrentGizmo = () => {
       try {
-        // Capture Local basis once when starting an edit
-        const meshes = this._main.getSelectedMeshes && this._main.getSelectedMeshes();
-        if (meshes && meshes.length) {
-          this.__gizmoPlusBasis = _getWorldBasisFromMesh(meshes[0]);
-        } else {
-          this.__gizmoPlusBasis = null;
-        }
+        const sm = main.getSculptManager && main.getSculptManager();
+        const tool = sm && sm.getCurrentTool && sm.getCurrentTool();
+        // El Transform tool guarda this._gizmo
+        const gizmo = tool && tool._gizmo;
+        if (!gizmo) return;
 
-        // Capture picked normal for Normal space
-        const picking = this._main.getPicking && this._main.getPicking();
-        if (picking && typeof picking.computePickedNormal === 'function') {
-          const n = picking.computePickedNormal();
-          this.__gizmoPlusNormal = n ? [n[0], n[1], n[2]] : null;
-        } else {
-          this.__gizmoPlusNormal = null;
-        }
-      } catch (e) {
-        // ignore
-      }
-      return origOnMouseDown.apply(this, arguments);
+        gizmo._ag_orientMode = this._space;
+        gizmo.setActivatedType(_axisMaskToActivatedType(this._mode, this._axisMask));
+        main.render();
+      } catch (e) { /* ignore */ }
     };
 
-    // Patch _startTranslateEdit so screen direction matches space axis
-    const origStartTranslate = proto._startTranslateEdit;
-    proto._startTranslateEdit = function() {
-      const main = this._main;
-      const camera = main.getCamera();
+    // UI: acciones simples (tu API actual solo garantiza addGuiAction)
+    const menu = 'Gizmo+';
 
-      const origin = this._editLineOrigin;
-      const dir2 = this._editLineDirection;
+    api.addGuiAction(menu, `Modo: ${this._labelMode()}`, () => {
+      this._mode = this._nextMode(this._mode);
+      this._refreshMenu(menu);
+      applyToCurrentGizmo();
+    });
 
-      // 3d origin (center of gizmo)
-      this._computeCenterGizmo(origin);
+    api.addGuiAction(menu, `Espacio: ${this._labelSpace()}`, () => {
+      this._space = this._nextSpace(this._space);
+      this._refreshMenu(menu);
+      applyToCurrentGizmo();
+    });
 
-      // 3d direction: use axis in world space based on space selection
-      const nbAxis = this._selected._nbAxis;
-      const axis = _getAxisWorld(this, nbAxis);
-      const p1 = v3.add(origin, axis);
+    api.addGuiAction(menu, `Ejes: ${this._labelAxes()}`, () => {
+      // ciclo simple de presets: XYZ -> X -> Y -> Z -> XY -> XZ -> YZ -> XYZ
+      const presets = [
+        { x: true, y: true, z: true },
+        { x: true, y: false, z: false },
+        { x: false, y: true, z: false },
+        { x: false, y: false, z: true },
+        { x: true, y: true, z: false },
+        { x: true, y: false, z: true },
+        { x: false, y: true, z: true },
+      ];
+      const cur = this._axisMask;
+      let idx = presets.findIndex(p => p.x===cur.x && p.y===cur.y && p.z===cur.z);
+      idx = (idx + 1) % presets.length;
+      this._axisMask = presets[idx];
+      this._refreshMenu(menu);
+      applyToCurrentGizmo();
+    });
 
-      // project on screen and get a 2D line
-      const o2 = camera.project([origin[0], origin[1], origin[2]]);
-      const d2 = camera.project([p1[0], p1[1], p1[2]]);
+    api.addGuiAction(menu, 'Refrescar UI Gizmo+', () => {
+      this._refreshMenu(menu, true);
+      applyToCurrentGizmo();
+    });
 
-      origin[0]=o2[0]; origin[1]=o2[1]; origin[2]=o2[2];
-      dir2[0]=d2[0]; dir2[1]=d2[1]; dir2[2]=d2[2];
+    // aplicar al inicio
+    applyToCurrentGizmo();
+  }
 
-      // normalize 2D direction
-      const dx = dir2[0]-origin[0];
-      const dy = dir2[1]-origin[1];
-      const l = Math.sqrt(dx*dx+dy*dy) || 1.0;
-      dir2[0]=dx/l; dir2[1]=dy/l;
+  _labelMode() {
+    return this._mode === 'move' ? 'Mover'
+      : this._mode === 'rotate' ? 'Rotar'
+      : this._mode === 'scale' ? 'Escalar'
+      : 'Universal';
+  }
 
-      const offset = this._editOffset;
-      offset[0] = main._mouseX - origin[0];
-      offset[1] = main._mouseY - origin[1];
-    };
+  _labelSpace() {
+    return this._space === 'global' ? 'Global'
+      : this._space === 'local' ? 'Local'
+      : 'Normal';
+  }
 
-    // Patch _updateTranslateEdit to use chosen axis (world) instead of fixed unit axis
-    const origUpdateTranslate = proto._updateTranslateEdit;
-    proto._updateTranslateEdit = function() {
-      const main = this._main;
-      const camera = main.getCamera();
+  _labelAxes() {
+    const a = this._axisMask;
+    return `${a.x?'X':''}${a.y?'Y':''}${a.z?'Z':''}` || 'â€”';
+  }
 
-      const origin2 = this._editLineOrigin;
-      const dir2 = this._editLineDirection;
+  _nextMode(m) {
+    if (m === 'universal') return 'move';
+    if (m === 'move') return 'rotate';
+    if (m === 'rotate') return 'scale';
+    return 'universal';
+  }
 
-      // compute closest point on the 2D helper line
-      let vx = main._mouseX - origin2[0];
-      let vy = main._mouseY - origin2[1];
-      vx -= this._editOffset[0];
-      vy -= this._editOffset[1];
-      const t2 = vx*dir2[0] + vy*dir2[1];
-      const px = origin2[0] + dir2[0]*t2;
-      const py = origin2[1] + dir2[1]*t2;
+  _nextSpace(s) {
+    if (s === 'global') return 'local';
+    if (s === 'local') return 'normal';
+    return 'global';
+  }
 
-      this._updateLineHelper(origin2[0], origin2[1], px, py);
-
-      // unproject a short ray in world
-      let near = camera.unproject(px, py, 0.0);
-      let far  = camera.unproject(px, py, 0.1);
-
-      // move to gizmo-centered coordinates (translation only, direction unchanged)
-      // (we keep original behavior using the existing matrices)
-      const trInv = this._editTransInv;
-      // apply translation inverse: p' = p - center
-      near = [near[0] + trInv[12], near[1] + trInv[13], near[2] + trInv[14]];
-      far  = [far[0]  + trInv[12], far[1]  + trInv[13], far[2]  + trInv[14]];
-
-      // ray direction
-      const rayDir = v3.norm(v3.sub(far, near));
-
-      const nbAxis = this._selected._nbAxis;
-      const axisDir = v3.norm(_getAxisWorld(this, nbAxis)); // direction in centered world
-
-      // Closest points between:
-      //   L0(s) = near + rayDir*s
-      //   L1(u) = axisDir*u  (line through origin along axis)
-      const a01 = -v3.dot(rayDir, axisDir);
-      const b0  = v3.dot(near, rayDir);
-      const det = Math.abs(1.0 - a01*a01) || 1e-8;
-      const b1  = -v3.dot(near, axisDir);
-      const u   = (a01*b0 - b1) / det;
-
-      const inter = v3.scale(axisDir, u);
-      this._updateMatrixTranslate(inter);
-
-      main.render();
-    };
-
-    // Patch rotation update so Local/Normal rotates around the chosen axis (world)
-    const origUpdateRotate = proto._updateRotateEdit;
-    proto._updateRotateEdit = function() {
-      const main = this._main;
-
-      const origin = this._editLineOrigin;
-      const dir = this._editLineDirection;
-
-      const vec = [main._mouseX - origin[0], main._mouseY - origin[1], 0.0];
-      const dist = vec[0]*dir[0] + vec[1]*dir[1];
-
-      this._updateLineHelper(origin[0], origin[1], origin[0] + dir[0]*dist, origin[1] + dir[1]*dist);
-
-      let angle = (7 * dist) / Math.min(main.getCanvasWidth(), main.getCanvasHeight());
-      angle %= Math.PI * 2;
-
-      const nbAxis = this._selected._nbAxis;
-      const axisWorld = _getAxisWorld(this, nbAxis);
-
-      const R = m4.rotAxis(axisWorld, -angle);
-
-      const meshes = this._main.getSelectedMeshes();
-      for (let i = 0; i < meshes.length; ++i) {
-        // Build edit = T * R * Tinv (world space around gizmo center)
-        const edit = m4.mul(this._editTrans, m4.mul(R, this._editTransInv));
-        // Convert to mesh local: localInv * edit * local
-        const localInv = this._editLocalInv[i];
-        const local = this._editLocal[i];
-        const editLocal = m4.mul(localInv, m4.mul(edit, local));
-
-        // write into mesh edit matrix
-        const mrot = meshes[i].getEditMatrix();
-        for (let k=0;k<16;k++) mrot[k] = editLocal[k];
-      }
-
-      main.render();
-    };
-
-    // Mark patched
-    this._patchedGizmoProto = true;
+  _refreshMenu(menuName, hard) {
+    // Con tu API actual no hay update de labels; esto es solo informativo:
+    // los labels se ven "fijos" hasta que refrescas la pÃ¡gina.
+    // Para que no sea confuso, dejamos un botÃ³n "Refrescar UI Gizmo+".
+    // Si luego agregas api.updateGuiLabel(...), aquÃ­ lo conectamos.
+    if (hard) {
+      console.log('[Gizmo+] Estado:', {
+        modo: this._mode,
+        espacio: this._space,
+        ejes: this._axisMask
+      });
+    }
   }
 }
