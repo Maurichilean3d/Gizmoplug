@@ -1,201 +1,168 @@
-export default class PolyModeCorePlugin {
+export default class PolyModeCore {
   constructor(api) {
     this.api = api;
-    this.pluginName = 'PolyMode Core';
-    this.active = false;
+    this.active = false; // Estado del modo selección
+    this.selection = new Set();
   }
 
   init() {
-    // Esperamos a que el motor esté 100% cargado
+    // Esperamos 500ms para asegurar que SculptGL inició completamente
     setTimeout(() => {
-      this._installCorePatches();
       this._installUI();
-      console.log(`${this.pluginName}: Núcleo de SculptGL intervenido.`);
+      this._overrideEngine(); // <--- Aquí ocurre la magia
+      console.log("PolyMode Core: Motor intervenido exitosamente.");
     }, 500);
   }
 
-  _installCorePatches() {
+  // =================================================================
+  // 1. OVERRIDE DEL MOTOR (La clave para que funcione en iPad)
+  // =================================================================
+  _overrideEngine() {
     const main = this.api.main;
-    const sculptManager = main.getSculptManager();
     
-    // =========================================================
-    // 1. INTERVENCIÓN DE INPUT (SculptGL.js -> onDeviceDown)
-    // =========================================================
-    // Guardamos la función original para llamarla si no estamos en modo selección
+    // Guardamos la función original de SculptGL para no romper nada
     const originalOnDeviceDown = main.onDeviceDown.bind(main);
 
+    // Reemplazamos el manejador de input de SculptGL con el nuestro
     main.onDeviceDown = (event) => {
-      // Si el plugin está activo y estamos en modo selección (FACE)
+      
+      // Si el modo Poly está ACTIVO, tomamos el control total
       if (this.active) {
-        // 1. Forzar cálculo de coordenadas nativo (arregla el problema de iPad/Retina)
+        // 1. Le pedimos a SculptGL que calcule la posición del mouse/dedo
+        // Esto usa su variable interna _pixelRatio (vital para iPad)
         main.setMousePosition(event);
         
-        // 2. Ejecutar picking interno
-        const mouseX = main._mouseX;
-        const mouseY = main._mouseY;
+        // 2. Usamos las coordenadas ya corregidas por el motor
+        const mx = main._mouseX;
+        const my = main._mouseY;
         const mesh = main.getMesh();
-        
+
         if (mesh) {
           const picking = main.getPicking();
-          if (picking.intersectionMouse(mesh, mouseX, mouseY)) {
-            const faceIdx = picking._idId;
-            this._toggleFaceSelection(mesh, faceIdx);
+          // 3. Ejecutamos el Raycast interno
+          if (picking.intersectionMouse(mesh, mx, my)) {
+            const faceIdx = picking._idId; // ID del triángulo tocado
+            this._toggleFace(mesh, faceIdx);
             
-            // Bloqueamos que la cámara rote o se mueva
+            // IMPORTANTE: Detenemos aquí. No llamamos a originalOnDeviceDown.
+            // Esto evita que rote la cámara o esculpa.
             return; 
           }
         }
       }
-      
-      // Si no es modo selección, ejecutamos el comportamiento normal (esculpir/cámara)
+
+      // Si NO está activo, dejamos que SculptGL funcione normal
       originalOnDeviceDown(event);
     };
-
-    // =========================================================
-    // 2. INTERVENCIÓN DEL SCULPT MANAGER (Desactivar Pincel)
-    // =========================================================
-    const originalStart = sculptManager.start.bind(sculptManager);
-    sculptManager.start = (elem) => {
-      if (this.active) return false; // Bloqueo total del pincel
-      return originalStart(elem);
-    };
   }
 
-  // =========================================================
-  // LÓGICA DE GEOMETRÍA (Mesh.js Manipulation)
-  // =========================================================
-
-  _toggleFaceSelection(mesh, faceIdx) {
-    // Inyectamos el Set de selección en el objeto mesh si no existe
-    if (!mesh._polySelection) {
-      mesh._polySelection = new Set();
-      // Guardamos colores originales para poder restaurar
-      mesh._originalColors = new Float32Array(mesh.getColors());
-    }
-
-    const sel = mesh._polySelection;
-    if (sel.has(faceIdx)) {
-      sel.delete(faceIdx);
+  // =================================================================
+  // 2. LÓGICA DE GEOMETRÍA (Pintar en GPU)
+  // =================================================================
+  _toggleFace(mesh, faceIdx) {
+    // Gestión del Set de selección
+    if (this.selection.has(faceIdx)) {
+      this.selection.delete(faceIdx);
     } else {
-      sel.add(faceIdx);
+      this.selection.add(faceIdx);
     }
 
-    this._updateMeshVisuals(mesh);
+    this._updateVisuals(mesh);
   }
 
-  _updateMeshVisuals(mesh) {
+  _updateVisuals(mesh) {
+    const colors = mesh.getColors(); // Float32Array directo del buffer
     const faces = mesh.getFaces();
-    const colors = mesh.getColors(); // Referencia directa al array de colores del motor
-    const sel = mesh._polySelection;
+    
+    // 1. Limpieza rápida: Poner todo en Gris Claro (0.8)
+    // (Para optimizar en mallas grandes, solo deberíamos despintar lo previo, 
+    // pero para asegurar que se ve, pintamos todo)
+    colors.fill(0.8); 
 
-    // 1. Restaurar todo a base (Blanco o el color original si lo guardamos)
-    // Para feedback claro en iPad, usaremos Gris Oscuro como base y Verde como selección
-    if (sel.size > 0) {
-      // Si hay selección, oscurecemos el resto para resaltar
-       for (let i = 0; i < colors.length; i++) colors[i] = 0.6; // Gris base
-    } else {
-       // Si no hay selección, volvemos a blanco
-       colors.fill(1.0);
-    }
-
-    // 2. Pintar selección (VERDE NEÓN)
-    sel.forEach(fIdx => {
+    // 2. Pintar selección de VERDE (0, 1, 0)
+    this.selection.forEach(fIdx => {
+      // Un triángulo tiene 3 vértices
       const v1 = faces[fIdx * 3];
       const v2 = faces[fIdx * 3 + 1];
       const v3 = faces[fIdx * 3 + 2];
-      
-      const r = 0.0, g = 1.0, b = 0.0; // Verde
 
-      // Vértice 1
-      colors[v1 * 3] = r; colors[v1 * 3 + 1] = g; colors[v1 * 3 + 2] = b;
-      // Vértice 2
-      colors[v2 * 3] = r; colors[v2 * 3 + 1] = g; colors[v2 * 3 + 2] = b;
-      // Vértice 3
-      colors[v3 * 3] = r; colors[v3 * 3 + 1] = g; colors[v3 * 3 + 2] = b;
+      // Pintamos los 3 vértices
+      const r = 0.0, g = 1.0, b = 0.0;
+      
+      colors[v1 * 3]     = r; colors[v1 * 3 + 1]     = g; colors[v1 * 3 + 2]     = b;
+      colors[v2 * 3]     = r; colors[v2 * 3 + 1]     = g; colors[v2 * 3 + 2]     = b;
+      colors[v3 * 3]     = r; colors[v3 * 3 + 1]     = g; colors[v3 * 3 + 2]     = b;
     });
 
-    // 3. ¡CRÍTICO! Forzar subida de buffer a GPU
-    // Mesh.js tiene métodos específicos para esto. Intentamos todos.
+    // 3. ¡GOLPE A LA GPU! Forzamos la actualización
+    // Intentamos los dos métodos posibles según la versión de SculptGL
     if (mesh.updateColor) mesh.updateColor();
-    if (mesh.updateBuffers) mesh.updateBuffers();
+    else if (mesh.updateBuffers) mesh.updateBuffers();
     
-    // 4. Renderizar escena
+    // Renderizamos la escena
     this.api.render();
   }
 
-  _clearSelection() {
-    const mesh = this.api.getMesh();
-    if (!mesh || !mesh._polySelection) return;
-    
-    mesh._polySelection.clear();
-    
-    // Restaurar blanco puro
-    const colors = mesh.getColors();
-    colors.fill(1.0);
-    
-    if (mesh.updateColor) mesh.updateColor();
-    this.api.render();
-  }
-
-  // =========================================================
-  // INTERFAZ DE USUARIO (UI)
-  // =========================================================
+  // =================================================================
+  // 3. INTERFAZ DE USUARIO (Barra Superior)
+  // =================================================================
   _installUI() {
-    this._injectCSS();
-    
-    // Barra superior
+    // Estilos CSS
+    if (!document.getElementById('pm-css')) {
+      const style = document.createElement('style');
+      style.id = 'pm-css';
+      style.innerHTML = `
+        .pm-btn { 
+          background: #333; color: #ddd; border: 1px solid #555; 
+          padding: 6px 12px; margin-left: 10px; border-radius: 4px; 
+          font-weight: bold; cursor: pointer; display: inline-block;
+        }
+        .pm-btn.active { 
+          background: #00AA00; color: #fff; border-color: #00FF00; 
+          box-shadow: 0 0 8px rgba(0,255,0,0.4); 
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    // Inyección en la barra superior
     const topBar = document.querySelector('.gui-topbar');
-    if (topBar && !document.getElementById('pm-core-bar')) {
-      const div = document.createElement('div');
-      div.id = 'pm-core-bar';
-      div.className = 'pm-bar';
-      
-      // Botón Toggle Modo
+    if (topBar && !document.getElementById('pm-toggle')) {
       const btn = document.createElement('button');
-      btn.innerText = '🖌️ Sculpt Mode';
+      btn.id = 'pm-toggle';
       btn.className = 'pm-btn';
+      btn.innerText = '🖌️ Sculpt Mode';
+      
       btn.onclick = () => {
         this.active = !this.active;
         if (this.active) {
-          btn.innerText = '🟩 POLY MODE (Activo)';
+          btn.innerText = '🟩 SELECT MODE';
           btn.classList.add('active');
+          // Limpiamos selección previa al entrar
+          this.selection.clear();
           this.api.main.setCanvasCursor('crosshair');
         } else {
           btn.innerText = '🖌️ Sculpt Mode';
           btn.classList.remove('active');
+          // Restauramos color al salir
+          const mesh = this.api.main.getMesh();
+          if(mesh) {
+            mesh.getColors().fill(1.0); // Blanco
+            if(mesh.updateColor) mesh.updateColor();
+            this.api.render();
+          }
           this.api.main.setCanvasCursor('default');
-          this._clearSelection(); // Limpiar visuales al salir
         }
       };
       
-      div.appendChild(btn);
-      topBar.appendChild(div);
+      // Insertar después del logo o al principio
+      topBar.appendChild(btn);
     }
-
-    // Menú lateral
-    this.api.addGuiAction('PolyMode', 'Limpiar Selección', () => this._clearSelection());
-    this.api.addGuiAction('PolyMode', 'Invertir', () => {
-        const mesh = this.api.getMesh();
-        if(!mesh) return;
-        if(!mesh._polySelection) mesh._polySelection = new Set();
-        const nbF = mesh.getNbFaces();
-        for(let i=0; i<nbF; i++) {
-            if(mesh._polySelection.has(i)) mesh._polySelection.delete(i);
-            else mesh._polySelection.add(i);
-        }
-        this._updateMeshVisuals(mesh);
+    
+    // Acción en menú Tools para limpiar
+    this.api.addGuiAction('PolyMode', 'Limpiar Selección', () => {
+      this.selection.clear();
+      if (this.api.main.getMesh()) this._updateVisuals(this.api.main.getMesh());
     });
-  }
-
-  _injectCSS() {
-    if (document.getElementById('pm-css')) return;
-    const style = document.createElement('style');
-    style.id = 'pm-css';
-    style.innerHTML = `
-      .pm-bar { display: inline-block; margin-left: 20px; border-left: 1px solid #555; padding-left: 10px; height: 100%; vertical-align: middle; }
-      .pm-btn { background: #333; color: white; border: 1px solid #444; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 12px; }
-      .pm-btn.active { background: #00AA00; border-color: #00FF00; box-shadow: 0 0 8px rgba(0,255,0,0.5); }
-    `;
-    document.head.appendChild(style);
   }
 }
