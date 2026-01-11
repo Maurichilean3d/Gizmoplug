@@ -1,114 +1,77 @@
 export default class PolyModePlugin {
   constructor(api) {
     this.api = api;
-    this.activeMode = 'SCULPT'; 
+    this.activeMode = 'SCULPT';
     this.selection = new Set();
     this.topology = null;
-    this._subscribed = false;
   }
 
   init() {
-    // Retraso para asegurar que SculptGL haya montado la escena y la GUI
-    setTimeout(() => {
-      this._injectStyles();
-      this._buildTopBar();
-      this._addMenuToSidebar();
-      this._bindEvents();
-      console.log("PolyMode: Sistema de selección activado.");
-    }, 800);
-  }
-
-  // --- INTERFAZ: MENÚ LATERAL ---
-  _addMenuToSidebar() {
-    const add = this.api.addGuiAction.bind(this.api);
-    // Estos comandos aparecerán en la pestaña "PolyMode" del menú derecho
-    add('PolyMode', 'CRECER Selección (+)', () => this._modifySelection('GROW'));
-    add('PolyMode', 'Seleccionar Isla (L)', () => this._modifySelection('ISLAND'));
-    add('PolyMode', 'Borrar Caras', () => this._deleteSelectedFaces());
-    add('PolyMode', 'Limpiar Selección', () => this._clearAll());
-  }
-
-  // --- INTERFAZ: BARRA SUPERIOR (TOPBAR) ---
-  _buildTopBar() {
-    const topBar = document.querySelector('.gui-topbar');
-    if (!topBar || document.getElementById('pm-toolbar')) return;
-
-    const container = document.createElement('div');
-    container.id = 'pm-toolbar';
-    container.className = 'pm-container';
+    this._injectStyles();
+    this._buildTopBar();
+    this._addMenuToSidebar();
     
-    const modes = [
-      { id: 'SCULPT', icon: '🖌️', label: 'Sculpt' },
-      { id: 'FACE',   icon: '🟦', label: 'Face' },
-      { id: 'VERT',   icon: '⚫', label: 'Vert' }
-    ];
-
-    modes.forEach(m => {
-      const btn = document.createElement('button');
-      btn.innerHTML = `${m.icon} ${m.label}`;
-      btn.className = `pm-btn ${m.id === 'SCULPT' ? 'active' : ''}`;
-      btn.id = `btn-${m.id.toLowerCase()}`;
-      btn.onclick = () => this._setMode(m.id);
-      container.appendChild(btn);
-    });
-
-    topBar.appendChild(container);
-  }
-
-  _setMode(mode) {
-    this.activeMode = mode;
-    document.querySelectorAll('.pm-btn').forEach(b => b.classList.remove('active'));
-    document.getElementById(`btn-${mode.toLowerCase()}`).classList.add('active');
-
-    const main = this.api.main;
-    if (mode !== 'SCULPT') {
-      main.getSculptManager()._currentTool = -1; // Desactivar pincel activo
-      main.setCursor('crosshair');
-    } else {
-      main.setCursor('default');
+    const canvas = this.api.getCanvas();
+    if (canvas) {
+      // Usamos 'pointerdown' para capturar tanto Apple Pencil como dedos y mouse en iPad
+      canvas.addEventListener('pointerdown', (e) => this._handleInteraction(e), true);
     }
   }
 
-  // --- LÓGICA DE INTERACCIÓN (PICKING REAL) ---
-  _bindEvents() {
-    if (this._subscribed) return;
-    const canvas = this.api.main._canvas;
-
-    canvas.addEventListener('mousedown', (e) => {
-      if (this.activeMode === 'SCULPT') return;
-
-      const main = this.api.main;
-      const mesh = main.getSelectedMeshes()[0];
-      if (!mesh) return;
-
-      const picking = main.getPicking();
-      // 'intersectionMouse' es el método clave de SculptGL para saber qué tocamos
-      if (picking.intersectionMouse(mesh, e.pageX, e.pageY)) {
-        const faceIdx = picking._idId; // Obtenemos el ID de la cara bajo el ratón
-
-        if (this.activeMode === 'FACE') {
-          if (e.shiftKey) {
-            this.selection.has(faceIdx) ? this.selection.delete(faceIdx) : this.selection.add(faceIdx);
-          } else {
-            this.selection.clear();
-            this.selection.add(faceIdx);
-          }
-        }
-        this._updateVisuals(mesh);
-      }
-    }, true);
-    this._subscribed = true;
+  _addMenuToSidebar() {
+    this.api.addGuiAction('PolyMode', 'CRECER Selección (+)', () => this._modifySelection('GROW'));
+    this.api.addGuiAction('PolyMode', 'Limpiar Todo', () => {
+      this.selection.clear();
+      this._updateVisuals();
+    });
   }
 
-  // --- VISUALIZACIÓN MEDIANTE MÁSCARA ---
-  _updateVisuals(mesh = this.api.main.getSelectedMeshes()[0]) {
+  _handleInteraction(e) {
+    if (this.activeMode === 'SCULPT') return;
+
+    const main = this.api.main;
+    const mesh = this.api.getMesh();
+    if (!mesh) return;
+
+    // Lógica vital para iPad: offset + pixelRatio
+    // SculptGL usa internamente estas variables para sus cálculos
+    const pr = main._pixelRatio || window.devicePixelRatio || 1;
+    const rect = main._canvas.getBoundingClientRect();
+    
+    // Calculamos la posición exacta del toque en el espacio de WebGL
+    const mouseX = (e.clientX - rect.left) * pr;
+    const mouseY = (e.clientY - rect.top) * pr;
+
+    const picking = this.api.getPicking();
+    
+    // Forzamos el picking en la posición del toque
+    if (picking.intersectionMouse(mesh, mouseX, mouseY)) {
+      const faceIdx = picking._idId;
+
+      if (this.activeMode === 'FACE') {
+        // En iPad, como no hay Shift, podemos alternar selección con cada toque
+        if (this.selection.has(faceIdx)) {
+          this.selection.delete(faceIdx);
+        } else {
+          this.selection.add(faceIdx);
+        }
+      }
+      
+      this._updateVisuals(mesh);
+      
+      // Detenemos la propagación para que el iPad no mueva la cámara al tocar
+      e.stopPropagation();
+      e.preventDefault();
+    }
+  }
+
+  _updateVisuals(mesh = this.api.getMesh()) {
     if (!mesh) return;
     const mask = mesh.getMaskArray();
     const faces = mesh.getFaces();
     
-    mask.fill(0.0); // Resetear máscara
+    mask.fill(0.0);
     this.selection.forEach(fIdx => {
-      // Pintar los 3 vértices de la cara seleccionada
       mask[faces[fIdx * 3]] = 1.0;
       mask[faces[fIdx * 3 + 1]] = 1.0;
       mask[faces[fIdx * 3 + 2]] = 1.0;
@@ -118,25 +81,76 @@ export default class PolyModePlugin {
     this.api.render();
   }
 
-  // --- ESTILOS CSS ---
+  _switchMode(mode) {
+    this.activeMode = mode;
+    document.querySelectorAll('.pm-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(`pm-btn-${mode}`).classList.add('active');
+
+    if (mode !== 'SCULPT') {
+      this.api.main.getSculptManager()._currentTool = -1;
+      this.api.main.setCanvasCursor('crosshair');
+    } else {
+      this.api.main.setCanvasCursor('default');
+    }
+  }
+
+  _buildTopBar() {
+    const topBar = document.querySelector('.gui-topbar');
+    if (!topBar || document.getElementById('pm-toolbar')) return;
+
+    const container = document.createElement('div');
+    container.id = 'pm-toolbar';
+    container.style = "display: inline-flex; align-items: center; margin-left: 10px; height: 100%; border-left: 1px solid #444; padding-left: 10px;";
+    
+    const modes = [
+      { id: 'SCULPT', icon: '🖌️', label: 'Sculpt' },
+      { id: 'FACE', icon: '🟦', label: 'Face' }
+    ];
+
+    modes.forEach(m => {
+      const btn = document.createElement('button');
+      btn.id = `pm-btn-${m.id}`;
+      btn.innerHTML = `${m.icon} ${m.label}`;
+      btn.className = 'pm-btn' + (m.id === 'SCULPT' ? ' active' : '');
+      btn.onclick = () => this._switchMode(m.id);
+      container.appendChild(btn);
+    });
+
+    topBar.appendChild(container);
+  }
+
   _injectStyles() {
     if (document.getElementById('pm-styles')) return;
     const s = document.createElement('style');
     s.id = 'pm-styles';
     s.innerHTML = `
-      .pm-container { display: flex; margin-left: 20px; align-items: center; gap: 5px; }
-      .pm-btn { 
-        background: #333; color: #fff; border: 1px solid #555; 
-        padding: 4px 10px; cursor: pointer; border-radius: 4px; font-size: 12px;
-      }
-      .pm-btn.active { background: #006655; border-color: #00ffcc; color: #00ffcc; }
-      .pm-btn:hover { background: #444; }
+      .pm-btn { background: #333; color: #fff; border: 1px solid #555; padding: 6px 12px; margin: 0 4px; cursor: pointer; font-size: 14px; border-radius: 5px; }
+      .pm-btn.active { border-color: #00ffcc; color: #00ffcc; background: #222; }
     `;
     document.head.appendChild(s);
   }
 
-  _clearAll() {
-    this.selection.clear();
-    this._updateVisuals();
+  _modifySelection(type) {
+    const mesh = this.api.getMesh();
+    if (!mesh || this.selection.size === 0) return;
+    const faces = mesh.getFaces();
+    
+    if (!this.topology) {
+      this.topology = Array.from({ length: mesh.getNbVertices() }, () => []);
+      for (let i = 0; i < faces.length / 3; i++) {
+        this.topology[faces[i * 3]].push(i);
+        this.topology[faces[i * 3 + 1]].push(i);
+        this.topology[faces[i * 3 + 2]].push(i);
+      }
+    }
+
+    let next = new Set(this.selection);
+    this.selection.forEach(fIdx => {
+      for (let i = 0; i < 3; i++) {
+        this.topology[faces[fIdx * 3 + i]].forEach(adj => next.add(adj));
+      }
+    });
+    this.selection = next;
+    this._updateVisuals(mesh);
   }
 }
