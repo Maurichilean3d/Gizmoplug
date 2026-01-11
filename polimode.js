@@ -1,96 +1,96 @@
 export default class PolyModePlugin {
   constructor(api) {
     this.api = api;
-    this.activeMode = 'SCULPT'; // Modos: SCULPT, VERTEX, FACE
+    this.activeMode = 'SCULPT';
     this.selection = new Set();
     this.topology = null;
+    this.pluginName = 'PolyMode Ultra';
   }
 
   init() {
-    // 1. Añadir al menú lateral "Tools" de SculptGL
-    this._setupSidebarMenu();
-
-    // 2. Inyectar la barra de herramientas en la parte superior (UI externa)
-    this._injectTopBar();
-
-    // 3. Preparar los eventos del mouse para capturar clics
-    this._setupInteraction();
-    
-    console.log("PolyMode Plugin: Cargado e Integrado en la interfaz.");
+    // Intentar inicializar la UI. Si falla, esperar un momento (SculptGL carga la GUI dinámicamente)
+    if (this.api.main && this.api.main._gui) {
+      this._setupAll();
+    } else {
+      setTimeout(() => this._setupAll(), 500);
+    }
   }
 
-  // --- INTEGRACIÓN EN EL MENÚ LATERAL (SIDEBAR) ---
-  _setupSidebarMenu() {
-    // addGuiAction(Carpeta, Etiqueta, Función)
-    const add = this.api.addGuiAction.bind(this.api);
+  _setupAll() {
+    this._injectStyles();
+    this._buildTopBar();
+    this._addMenuToTools();
+    this._setupInteraction();
+    console.log(`${this.pluginName} integrado correctamente.`);
+  }
 
-    add('PolyMode: Operaciones', 'Expandir Selección (+)', () => this._modifySelection('GROW'));
-    add('PolyMode: Operaciones', 'Contraer Selección (-)', () => this._modifySelection('SHRINK'));
-    add('PolyMode: Operaciones', 'Seleccionar Isla (L)', () => this._modifySelection('ISLAND'));
-    add('PolyMode: Operaciones', 'Invertir Selección', () => this._modifySelection('INVERT'));
-    add('PolyMode: Operaciones', 'Limpiar Selección', () => {
+  // 1. MODIFICAR EL MENÚ DE LA DERECHA (TOOLS)
+  _addMenuToTools() {
+    const api = this.api;
+    // Creamos una carpeta dedicada en el menú de la derecha
+    // Nota: 'PolyMode' será el nombre de la sección en la barra lateral
+    api.addGuiAction('PolyMode', '--- MODO SELECCIÓN ---', () => {});
+    api.addGuiAction('PolyMode', 'Expandir Selección (+)', () => this._modifySelection('GROW'));
+    api.addGuiAction('PolyMode', 'Seleccionar Isla (L)', () => this._modifySelection('ISLAND'));
+    api.addGuiAction('PolyMode', 'Limpiar Todo', () => {
       this.selection.clear();
       this._updateVisuals();
     });
+    
+    // Forzamos a la GUI a actualizarse si es posible
+    if (this.api.main._gui) this.api.main._gui.updateDisplay();
   }
 
-  // --- INTEGRACIÓN EN LA BARRA SUPERIOR (TOPBAR) ---
-  _injectTopBar() {
-    // Buscamos el contenedor de la barra superior de SculptGL
+  // 2. MODIFICAR LA BARRA SUPERIOR (TOP BAR)
+  _buildTopBar() {
     const topBar = document.querySelector('.gui-topbar');
     if (!topBar) return;
 
-    // Crear el contenedor de botones de modo
-    const modeContainer = document.createElement('div');
-    modeContainer.style = "display: inline-flex; margin-left: 20px; border-left: 1px solid #555; padding-left: 15px;";
-    modeContainer.id = "poly-mode-selector";
+    // Evitar duplicados si se recarga el plugin
+    if (document.getElementById('poly-mode-toolbar')) return;
 
+    const container = document.createElement('div');
+    container.id = 'poly-mode-toolbar';
+    container.style = "display: inline-flex; align-items: center; margin-left: 15px; border-left: 1px solid #444; padding-left: 10px; height: 100%;";
+    
     const modes = [
-      { id: 'SCULPT', icon: '🖌️', label: 'Esculpir' },
-      { id: 'VERTEX', icon: '⚫', label: 'Vértices' },
-      { id: 'FACE',   icon: '🟦', label: 'Caras' }
+      { id: 'SCULPT', icon: '🖌️', label: 'Sculpt' },
+      { id: 'FACE', icon: '🟦', label: 'Face' },
+      { id: 'VERT', icon: '⚫', label: 'Vert' }
     ];
 
     modes.forEach(m => {
       const btn = document.createElement('button');
+      btn.id = `pm-btn-${m.id}`;
       btn.innerHTML = `${m.icon} ${m.label}`;
-      btn.style = "background: #333; color: white; border: 1px solid #444; margin-right: 5px; cursor: pointer; padding: 4px 8px; font-size: 11px;";
-      btn.id = `btn-mode-${m.id}`;
-      
-      if (m.id === 'SCULPT') btn.style.borderColor = '#00ffcc';
-
+      btn.className = 'poly-mode-btn' + (m.id === 'SCULPT' ? ' active' : '');
       btn.onclick = () => this._switchMode(m.id);
-      modeContainer.appendChild(btn);
+      container.appendChild(btn);
     });
 
-    topBar.appendChild(modeContainer);
+    topBar.appendChild(container);
   }
 
-  _switchMode(newMode) {
-    this.activeMode = newMode;
-    
-    // Actualizar feedback visual de los botones
-    document.querySelectorAll('#poly-mode-selector button').forEach(btn => {
-      btn.style.borderColor = '#444';
-    });
-    document.getElementById(`btn-mode-${newMode}`).style.borderColor = '#00ffcc';
+  _switchMode(mode) {
+    this.activeMode = mode;
+    // Actualizar visual de botones
+    document.querySelectorAll('.poly-mode-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(`pm-btn-${mode}`).classList.add('active');
 
-    // Si no es modo Sculpt, desactivamos la herramienta de escultura actual
     const sculptMgr = this.api.main.getSculptManager();
-    if (newMode !== 'SCULPT') {
-      sculptMgr._currentTool = null; 
+    if (mode !== 'SCULPT') {
+      sculptMgr._currentTool = -1; // Desactiva la herramienta actual de escultura
       this.api.main.setCursor('crosshair');
     } else {
       this.api.main.setCursor('default');
     }
   }
 
-  // --- MANEJO DE SELECCIÓN POR TOPOLOGÍA ---
+  // 3. INTERVENCIÓN DE CLIC PARA SELECCIÓN POLIGONAL
   _setupInteraction() {
     const main = this.api.main;
     const canvas = main._canvas;
-    
-    // Sobrescribimos el comportamiento del click cuando el modo no es Sculpt
+
     canvas.addEventListener('mousedown', (e) => {
       if (this.activeMode === 'SCULPT') return;
 
@@ -98,59 +98,19 @@ export default class PolyModePlugin {
       if (!mesh) return;
 
       const picking = main.getPicking();
+      // Usar el sistema de picking nativo de SculptGL (como en Gizmo.js)
       if (picking.intersectionMouse(mesh, e.pageX, e.pageY)) {
-        const faceIdx = picking._idId; // ID de la cara seleccionada
-
-        if (this.activeMode === 'FACE') {
-          if (e.shiftKey) {
-            this.selection.has(faceIdx) ? this.selection.delete(faceIdx) : this.selection.add(faceIdx);
-          } else {
-            this.selection.clear();
-            this.selection.add(faceIdx);
-          }
-        }
-        // Aquí se añadiría lógica para VERTEX buscando el vértice más cercano del triángulo
+        const faceIdx = picking._idId; 
         
+        if (e.shiftKey) {
+          this.selection.has(faceIdx) ? this.selection.delete(faceIdx) : this.selection.add(faceIdx);
+        } else {
+          this.selection.clear();
+          this.selection.add(faceIdx);
+        }
         this._updateVisuals(mesh);
       }
     }, true);
-  }
-
-  _modifySelection(action) {
-    const mesh = this.api.main.getSelectedMeshes()[0];
-    if (!mesh) return;
-
-    if (!this.topology) this._buildTopology(mesh);
-    const faces = mesh.getFaces();
-    let newSelection = new Set(this.selection);
-
-    if (action === 'GROW') {
-      this.selection.forEach(fIdx => {
-        for (let i = 0; i < 3; i++) {
-          const vIdx = faces[fIdx * 3 + i];
-          this.topology[vIdx].forEach(adjFace => newSelection.add(adjFace));
-        }
-      });
-    }
-
-    if (action === 'ISLAND') {
-      let stack = Array.from(this.selection);
-      while (stack.length > 0) {
-        const fIdx = stack.pop();
-        for (let i = 0; i < 3; i++) {
-          const vIdx = faces[fIdx * 3 + i];
-          this.topology[vIdx].forEach(adjFace => {
-            if (!newSelection.has(adjFace)) {
-              newSelection.add(adjFace);
-              stack.push(adjFace);
-            }
-          });
-        }
-      }
-    }
-
-    this.selection = newSelection;
-    this._updateVisuals(mesh);
   }
 
   _updateVisuals(mesh = this.api.main.getSelectedMeshes()[0]) {
@@ -158,6 +118,7 @@ export default class PolyModePlugin {
     const mask = mesh.getMaskArray();
     const faces = mesh.getFaces();
     
+    // Usamos el sistema de Máscaras para resaltar (estética roja)
     mask.fill(0.0);
     this.selection.forEach(fIdx => {
       mask[faces[fIdx * 3]] = 1.0;
@@ -169,14 +130,59 @@ export default class PolyModePlugin {
     this.api.render();
   }
 
-  _buildTopology(mesh) {
-    const nbV = mesh.getNbVertices();
+  // 4. ESTILOS PARA LA INTERFAZ INYECTADA
+  _injectStyles() {
+    if (document.getElementById('poly-mode-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'poly-mode-styles';
+    style.innerHTML = `
+      .poly-mode-btn {
+        background: #222;
+        border: 1px solid #444;
+        color: #aaa;
+        padding: 4px 10px;
+        margin: 0 2px;
+        border-radius: 3px;
+        cursor: pointer;
+        font-size: 11px;
+        transition: all 0.2s;
+      }
+      .poly-mode-btn:hover { background: #333; color: #fff; }
+      .poly-mode-btn.active {
+        background: #008170;
+        color: #fff;
+        border-color: #00ffcc;
+        box-shadow: 0 0 5px rgba(0,255,204,0.3);
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // Lógica de topología (Simplificada para rendimiento)
+  _modifySelection(type) {
+    const mesh = this.api.main.getSelectedMeshes()[0];
+    if (!mesh || this.selection.size === 0) return;
+
     const faces = mesh.getFaces();
-    this.topology = Array.from({ length: nbV }, () => []);
-    for (let i = 0; i < faces.length / 3; i++) {
-      this.topology[faces[i * 3]].push(i);
-      this.topology[faces[i * 3 + 1]].push(i);
-      this.topology[faces[i * 3 + 2]].push(i);
+    if (!this.topology) {
+        this.topology = Array.from({ length: mesh.getNbVertices() }, () => []);
+        for (let i = 0; i < faces.length / 3; i++) {
+          this.topology[faces[i * 3]].push(i);
+          this.topology[faces[i * 3 + 1]].push(i);
+          this.topology[faces[i * 3 + 2]].push(i);
+        }
     }
+
+    let nextSel = new Set(this.selection);
+    if (type === 'GROW') {
+      this.selection.forEach(fIdx => {
+        for (let i = 0; i < 3; i++) {
+          const vIdx = faces[fIdx * 3 + i];
+          this.topology[vIdx].forEach(adj => nextSel.add(adj));
+        }
+      });
+    }
+    this.selection = nextSel;
+    this._updateVisuals(mesh);
   }
 }
